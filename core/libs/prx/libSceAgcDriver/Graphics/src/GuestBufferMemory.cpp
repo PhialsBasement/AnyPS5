@@ -481,6 +481,21 @@ int udmabufDevice() {
     return device;
 }
 
+const char* importDmaBuf(const Context& context, HostImport& entry, int buffer, VkResult& failure) {
+    VkMemoryFdPropertiesKHR properties{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+    if (const auto result = context.Function<PFN_vkGetMemoryFdPropertiesKHR>("vkGetMemoryFdPropertiesKHR")(context.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, buffer, &properties); result != VK_SUCCESS) {
+        close(buffer);
+        failure = result;
+        return "vkGetMemoryFdPropertiesKHR";
+    }
+    const VkImportMemoryFdInfoKHR import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, buffer};
+    bool allocated = false;
+    const char* step = bindImport(context, entry, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, &import, properties.memoryTypeBits, allocated, failure);
+    if (!allocated) close(buffer);
+    entry.dmaBuf = step == nullptr;
+    return step;
+}
+
 const char* createDmaBufImport(const Context& context, HostImport& entry, int file, std::uint64_t offset, VkResult& failure) {
     udmabuf_create request{};
     request.memfd = static_cast<std::uint32_t>(file);
@@ -494,18 +509,76 @@ const char* createDmaBufImport(const Context& context, HostImport& entry, int fi
         failure = VK_ERROR_INVALID_EXTERNAL_HANDLE;
         return device < 0 ? "open /dev/udmabuf" : "UDMABUF_CREATE";
     }
-    VkMemoryFdPropertiesKHR properties{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
-    if (const auto result = context.Function<PFN_vkGetMemoryFdPropertiesKHR>("vkGetMemoryFdPropertiesKHR")(context.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, buffer, &properties); result != VK_SUCCESS) {
-        close(buffer);
-        failure = result;
-        return "vkGetMemoryFdPropertiesKHR";
+    return importDmaBuf(context, entry, buffer, failure);
+}
+
+struct BackingSegment {
+    int file = -1;
+    std::uint64_t offset = 0;
+    std::uint64_t bytes = 0;
+};
+
+struct BackingSegments {
+    BackingSegments() = default;
+    BackingSegments(const BackingSegments&) = delete;
+    BackingSegments& operator=(const BackingSegments&) = delete;
+    ~BackingSegments() {
+        for (const auto& segment : list) close(segment.file);
     }
-    const VkImportMemoryFdInfoKHR import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, buffer};
-    bool allocated = false;
-    const char* step = bindImport(context, entry, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, &import, properties.memoryTypeBits, allocated, failure);
-    if (!allocated) close(buffer);
-    entry.dmaBuf = step == nullptr;
-    return step;
+    std::vector<BackingSegment> list;
+};
+
+bool linearBacking(std::uintptr_t address, std::uint64_t bytes, BackingSegment* segment) {
+    int file = -1;
+    std::uint64_t offset = 0;
+    if (!GuestArena::GuestArenaSharedBacking_nid_postfix(address, static_cast<std::size_t>(bytes), &file, &offset)) return false;
+    if (segment == nullptr) {
+        close(file);
+        return true;
+    }
+    *segment = {file, offset, bytes};
+    return true;
+}
+
+bool sharedSegments(const Context& context, const HostImport& entry, BackingSegments& segments) {
+    const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+    if (!context.dmaBufImport || page == 0 || entry.base % page != 0 || entry.bytes % page != 0) return false;
+    const auto end = entry.base + entry.bytes;
+    for (auto cursor = entry.base; cursor < end;) {
+        if (!linearBacking(cursor, page, nullptr)) return false;
+        auto known = page;
+        auto step = page;
+        while (cursor + known + step <= end && linearBacking(cursor, known + step, nullptr)) {
+            known += step;
+            step *= 2;
+        }
+        for (step /= 2; step >= page; step /= 2) {
+            if (cursor + known + step <= end && linearBacking(cursor, known + step, nullptr)) known += step;
+        }
+        BackingSegment segment;
+        if (!linearBacking(cursor, known, &segment)) return false;
+        segments.list.push_back(segment);
+        cursor += known;
+    }
+    return segments.list.size() > 1;
+}
+
+const char* createSegmentedDmaBufImport(const Context& context, HostImport& entry, const BackingSegments& segments, VkResult& failure) {
+    std::vector<std::byte> storage(sizeof(udmabuf_create_list) + segments.list.size() * sizeof(udmabuf_create_item));
+    auto* request = reinterpret_cast<udmabuf_create_list*>(storage.data());
+    request->flags = UDMABUF_FLAGS_CLOEXEC;
+    request->count = static_cast<std::uint32_t>(segments.list.size());
+    for (std::size_t index = 0; index < segments.list.size(); ++index) {
+        const auto& segment = segments.list[index];
+        request->list[index] = {static_cast<std::uint32_t>(segment.file), 0, segment.offset, segment.bytes};
+    }
+    const int device = udmabufDevice();
+    const int buffer = device < 0 ? -1 : ioctl(device, UDMABUF_CREATE_LIST, request);
+    if (buffer < 0) {
+        failure = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        return device < 0 ? "open /dev/udmabuf" : "UDMABUF_CREATE_LIST";
+    }
+    return importDmaBuf(context, entry, buffer, failure);
 }
 #endif
 
@@ -782,6 +855,7 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
 #ifndef _WIN32
     BackingFile backing;
     if (step != nullptr && sharedBacking(context, entry, backing)) step = createBackingImport(context, entry, backing, failure);
+    else if (BackingSegments segments; step != nullptr && sharedSegments(context, entry, segments)) step = createSegmentedDmaBufImport(context, entry, segments, failure);
 #endif
     return step;
 }
@@ -1556,6 +1630,11 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     if (BackingFile backing; step != nullptr && watchedDmaBuf != watchedHostPointer && sharedBacking(context, entry, backing)) {
         GuestMemory::ImportWatched(base, bytes, [&] {
             step = createBackingImport(context, entry, backing, result);
+            return step == nullptr;
+        }, watchedDmaBuf);
+    } else if (BackingSegments segments; step != nullptr && watchedDmaBuf != watchedHostPointer && sharedSegments(context, entry, segments)) {
+        GuestMemory::ImportWatched(base, bytes, [&] {
+            step = createSegmentedDmaBufImport(context, entry, segments, result);
             return step == nullptr;
         }, watchedDmaBuf);
     }
