@@ -1305,6 +1305,8 @@ ImportRun joinedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, s
     if (run.ranges.empty()) return run;
     if (std::all_of(run.ranges.begin(), run.ranges.end(), [window](const auto& range) { return range->bytes > window; })) return run;
     if (begin == run.base && end == run.base + run.bytes) return run;
+    static const bool joinCrossed = std::getenv("APS5_JOIN_CROSSED") != nullptr;
+    if (joinCrossed) return run;
     return {};
 }
 
@@ -1681,6 +1683,18 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
     static std::uint64_t importedBytes = 0;
     importedBytes += bytes;
+    {
+        static std::uint64_t windowImports = 0, windowBytes = 0, windowJoined = 0;
+        static auto windowAt = std::chrono::steady_clock::now();
+        ++windowImports;
+        windowBytes += bytes;
+        if (joined) ++windowJoined;
+        if (std::chrono::steady_clock::now() - windowAt > std::chrono::seconds(10)) {
+            std::fprintf(stderr, "[probe-imported] %llu imports (%llu joined), %.0f MiB in the last window\n", static_cast<unsigned long long>(windowImports), static_cast<unsigned long long>(windowJoined), windowBytes / 1048576.0);
+            windowAt = std::chrono::steady_clock::now();
+            windowImports = windowBytes = windowJoined = 0;
+        }
+    }
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     state.liveBytes += bytes;
     if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)%s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0, joined ? ", joined at bind" : "");
@@ -4416,6 +4430,25 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
             auto& bucket = outside[region.begin >> 28u];
             ++bucket.first;
             bucket.second += bufferBytes;
+            {
+                static std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> why;
+                static auto whyAt = std::chrono::steady_clock::now();
+                std::vector<RegisteredPiece> pieces;
+                const bool registered = RegisteredReadableCovers(region.begin, static_cast<std::size_t>(region.end - region.begin), &pieces);
+                const bool firstCovered = ExistingHostImportFor(context, region.begin, 1) != nullptr;
+                const bool lastCovered = ExistingHostImportFor(context, region.end - 1, 1) != nullptr;
+                const bool gpuPieces = std::all_of(pieces.begin(), pieces.end(), [](const RegisteredPiece& piece) { return piece.gpu; });
+                char key[160];
+                std::snprintf(key, sizeof(key), "0x%llx reg=%d pieces=%zu gpu=%d first=%d last=%d sparse=%d writable=%d", static_cast<unsigned long long>(region.begin >> 28u), registered ? 1 : 0, pieces.size(), gpuPieces ? 1 : 0, firstCovered ? 1 : 0, lastCovered ? 1 : 0, region.sparse ? 1 : 0, region.writable ? 1 : 0);
+                auto& entry = why[key];
+                ++entry.first;
+                entry.second += bufferBytes;
+                if (std::chrono::steady_clock::now() - whyAt > std::chrono::seconds(10)) {
+                    whyAt = std::chrono::steady_clock::now();
+                    for (const auto& [reason, counts] : why) std::fprintf(stderr, "[probe-import] %s: %llu copies %.0f MiB\n", reason.c_str(), static_cast<unsigned long long>(counts.first), counts.second / 1048576.0);
+                    why.clear();
+                }
+            }
         }
         if (++uploads % 1000 == 0) {
             AgcDriver::ProfilePrint_nid_no_patch("[buffers] %llu completed CPU-copy operations: logical spans %.0f MiB, buffer spans %.0f MiB, bytes read %.0f MiB; %llu snapshots (%.0f MiB), %llu misaligned in imports (%.0f MiB), %llu outside imports (%.0f MiB):", static_cast<unsigned long long>(uploads), logicalBytes / 1048576.0, (snapshotBytes + misalignedBytes + noImportBytes) / 1048576.0, readTotalBytes / 1048576.0, static_cast<unsigned long long>(snapshotOnly), snapshotBytes / 1048576.0, static_cast<unsigned long long>(misaligned), misalignedBytes / 1048576.0, static_cast<unsigned long long>(noImport), noImportBytes / 1048576.0);
