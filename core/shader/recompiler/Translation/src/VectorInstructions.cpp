@@ -103,7 +103,9 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
     if (denormals == 1u || denormals == 2u) {
         throw std::runtime_error("f32 denormal mode " + std::to_string(denormals) + " at pc " + std::to_string(inst.programCounter) + " is not implemented");
     }
-    return denormals == 0u ? flush : 0u;
+    if (denormals != 0u) return 0u;
+    const bool hostFlushes = inst.op == RdnaOpcode::VAddF32 || inst.op == RdnaOpcode::VSubF32 || inst.op == RdnaOpcode::VSubrevF32 || inst.op == RdnaOpcode::VMulF32 || inst.op == RdnaOpcode::VMacF32 || inst.op == RdnaOpcode::VMadmkF32 || inst.op == RdnaOpcode::VMadakF32 || inst.op == RdnaOpcode::VFmaF32;
+    return hostFlushes && nativeFloat32Mode() ? 0u : flush;
 }
 
 bool TranslationContext::emitVector(const RdnaInstruction& inst) {

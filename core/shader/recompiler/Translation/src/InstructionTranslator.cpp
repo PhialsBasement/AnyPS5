@@ -3,6 +3,7 @@
 #include "Translation/DispatchInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -560,12 +561,19 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
     }
 
     const auto entryRounding = ComputeEntryRounding(cfg, decoded, options.floatMode.has_value() ? options.floatMode->floatMode : 0u);
+    static const bool nativeFloat32Requested = std::getenv("APS5_NATIVE_F32") != nullptr;
+    const std::uint32_t declaredMode = options.floatMode.has_value() ? options.floatMode->floatMode : 0u;
+    const bool nativeFloat32 = nativeFloat32Requested && (declaredMode & (ModeRoundBits | 0x30u)) == 0u && std::none_of(decoded.instructions.begin(), decoded.instructions.end(), [](const RdnaInstruction& instruction) {
+        const auto write = DecodeRoundingWrite(instruction);
+        return write.has_value() && (write->mask & ModeRoundBits) != 0u && (!write->known || (write->value & ModeRoundBits) != 0u);
+    });
     for (const auto& cfgBlock : cfg.blocks) {
         const auto typedIndex = blockIndices.at(cfgBlock.id);
         TranslationContext context(program, *blocks[typedIndex], vectorLimit);
         context.SetPixelInput(options.inputInfo.pixel, options.fragmentShaderBarycentricEnabled);
         context.SetFloatMode(options.floatMode);
         context.SetNativeFloat16(options.nativeFloat16);
+        context.SetNativeFloat32(nativeFloat32);
         context.SetEntryRounding(entryRounding.at(cfgBlock.id));
         for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
             const auto& instruction = decoded.instructions[index];

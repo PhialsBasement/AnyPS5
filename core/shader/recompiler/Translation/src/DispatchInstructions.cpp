@@ -26,6 +26,7 @@ void TranslationContext::TranslateInstruction(const RdnaInstruction& decoded) {
     }
     checkRoundingUse(instruction);
     f32DenormalFlush = f32DenormalFlushFor(instruction);
+    if (nativeFloat32Mode()) program.Metadata().float32FlushToZero = true;
     bool translated = false;
     switch (instruction.family) {
         case RdnaInstructionFamily::SOP1:
